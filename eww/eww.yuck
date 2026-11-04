@@ -2,7 +2,7 @@
 ;; defines an `audition` window (copy this into yours to give it your theme).
 (deflisten trial
   :initial '{"active":false,"left":"","files":"","pct":0}'
-  `audition stream`)
+  `$HOME/.local/bin/audition stream`)
 
 (defwindow audition
   :monitor 0
