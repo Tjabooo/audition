@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""audition: try a config change; it reverts itself unless you keep it.
+
+  audition [-t SECONDS] FILE...   snapshot FILEs, open them in $EDITOR,
+                                  then apply and start the countdown (default 45 s)
+  audition --no-edit FILE...      snapshot now; you edit elsewhere and
+                                  run `audition apply` when ready
+  audition apply                  apply the edited files + start countdown
+  audition keep                   accept the change
+  audition revert                 roll back now
+  audition status | stream        JSON for a bar or the eww countdown
+
+Like a display-settings "Keep these changes?" dialog, for any config file. Rollback runs from a
+systemd user timer, so it still happens if your compositor or terminal dies mid-trial. Hyprland
+config errors revert immediately. Applying reloads what the files belong to: Hyprland, sway,
+Waybar, eww, dunst, mako.
+"""
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+ROOT = Path(__file__).resolve().parent
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+TRIAL = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "audition"
+META = TRIAL / "trial.json"
+UNIT = "audition-rollback"
+DEFAULT_SECONDS = int(os.environ.get("AUDITION_SECONDS", 45))
+FREEDESKTOP = {"relay": "message", "saved": "complete", "warn": "dialog-warning"}
+
+
+def find_eww_config():
+    """AUDITION_EWW, else your own eww config if it defines an `audition` window, else the bundled one."""
+    if os.environ.get("AUDITION_EWW"):
+        return Path(os.environ["AUDITION_EWW"]).expanduser()
+    for folder in [XDG_CONFIG / "eww", *sorted(XDG_CONFIG.glob("*/eww"))]:
+        try:
+            if "defwindow audition" in (folder / "eww.yuck").read_text(errors="replace"):
+                return folder
+        except OSError:
+            pass
+    return ROOT / "eww"
+
+
+EWW_CFG = find_eww_config()
+
+
+def sh(*cmd, timeout=20):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def meta():
+    try:
+        return json.loads(META.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def write_meta(m):
+    TRIAL.mkdir(parents=True, exist_ok=True)
+    tmp = META.with_suffix(".tmp")
+    tmp.write_text(json.dumps(m, indent=1))
+    tmp.replace(META)
+
+
+def sound(name):
+    """A freedesktop theme sound, if there is one and a player (AUDITION_SOUNDS=0 turns them off)."""
+    if os.environ.get("AUDITION_SOUNDS") == "0":
+        return
+    f = next((p for ext in ("oga", "ogg", "wav")
+              if (p := Path(f"/usr/share/sounds/freedesktop/stereo/{FREEDESKTOP[name]}.{ext}")).exists()), None)
+    player = shutil.which("pw-play") or shutil.which("paplay")
+    if f and player:
+        subprocess.Popen([player, str(f)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def notify(title, body="", urgency="normal"):
+    sh("notify-send", "-a", "audition", "-u", urgency, title, body)
+
+
+def eww(*args):
+    """The countdown overlay, when eww is installed (otherwise a notification says the same)."""
+    if not shutil.which("eww"):
+        return False
+    if args[0] == "open" and sh("eww", "-c", str(EWW_CFG), "ping")[1] != "pong":
+        subprocess.Popen(["eww", "-c", str(EWW_CFG), "daemon"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(40):
+            time.sleep(0.1)
+            if sh("eww", "-c", str(EWW_CFG), "ping")[1] == "pong":
+                break
+    return sh("eww", "-c", str(EWW_CFG), *args)[0] == 0
+
+
+# ── reload whatever the edited files belong to ──────────────────────────────
+def reload_for(files):
+    errors = []
+    kinds = {kind(f) for f in files}
+    if "sway" in kinds:
+        rc, out = sh("swaymsg", "reload")
+        if rc:
+            errors.append(out)
+    if "mako" in kinds:
+        sh("makoctl", "reload")
+    if "hypr" in kinds:
+        sh("hyprctl", "reload")
+        time.sleep(0.4)
+        rc, out = sh("hyprctl", "configerrors")
+        out = "\n".join(l for l in out.splitlines() if l.strip())
+        if out and "no errors" not in out.lower() and out != (meta() or {}).get("baseline_errors", ""):
+            errors.append(out)
+    if "waybar" in kinds:
+        sh("pkill", "waybar")
+        time.sleep(0.3)
+        subprocess.Popen(["setsid", "-f", "waybar"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if "eww" in kinds:
+        eww("reload")
+    if "dunst" in kinds:
+        sh("killall", "dunst")
+    return errors
+
+
+def kind(f):
+    s = str(f)
+    for k in ("hypr", "sway", "waybar", "eww", "dunst", "mako"):
+        if f"/{k}/" in s:
+            return k
+    return "other"
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+def start(files, seconds, edit):
+    if meta():
+        sys.exit("A trial is already running: `audition keep` or `audition revert` first.")
+    files = [Path(f).expanduser().resolve() for f in files]
+    for f in files:
+        if not f.is_file():
+            sys.exit(f"not a file: {f}")
+    if TRIAL.exists():
+        shutil.rmtree(TRIAL)
+    (TRIAL / "good").mkdir(parents=True)
+    snaps = []
+    for i, f in enumerate(files):
+        dst = TRIAL / "good" / f"{i}_{f.name}"
+        shutil.copy2(f, dst)
+        snaps.append({"file": str(f), "snap": str(dst)})
+    rc, base = sh("hyprctl", "configerrors")
+    base = "\n".join(l for l in base.splitlines() if l.strip())
+    write_meta({"files": snaps, "seconds": seconds, "state": "editing", "deadline": 0,
+                "baseline_errors": "" if "no errors" in base.lower() else base})
+    if not edit:
+        print("Snapshot taken. Edit the files, then run: audition apply")
+        return
+    editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nvim")
+    try:
+        subprocess.run([*editor, *map(str, files)])
+    except FileNotFoundError:
+        shutil.rmtree(TRIAL, ignore_errors=True)
+        sys.exit(f"editor not found: {editor[0]} (set $EDITOR)")
+    apply()
+
+
+def changed(m):
+    return [s for s in m["files"] if Path(s["file"]).read_bytes() != Path(s["snap"]).read_bytes()]
+
+
+def apply():
+    m = meta()
+    if not m:
+        sys.exit("No trial in progress.")
+    diff = changed(m)
+    if not diff:
+        print("Nothing changed, trial cancelled.")
+        shutil.rmtree(TRIAL, ignore_errors=True)
+        return
+    errors = reload_for([d["file"] for d in diff])
+    if errors:
+        print("Config errors, reverting straight away:\n" + "\n".join(errors))
+        revert(reason="config errors")
+        return
+    m["state"] = "trial"
+    m["deadline"] = time.time() + m["seconds"]
+    m["changed"] = [Path(d["file"]).name for d in diff]
+    write_meta(m)
+    sh("systemctl", "--user", "stop", f"{UNIT}.timer")
+    sh("systemctl", "--user", "reset-failed", f"{UNIT}.timer", f"{UNIT}.service")
+    # the timer runs outside Hyprland, so hand it the session it must reload
+    env = [f"--setenv={k}={os.environ[k]}" for k in
+           ("HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR") if os.environ.get(k)]
+    rc, out = sh("systemd-run", "--user", f"--unit={UNIT}", f"--on-active={m['seconds']}",
+                 "--timer-property=AccuracySec=1s", *env, sys.argv[0] if sys.argv[0].startswith("/")
+                 else str(Path(shutil.which(sys.argv[0]) or HOME / ".local/bin/audition").resolve()), "revert", "--timeout")
+    if rc != 0:
+        print("couldn't start the rollback timer:", out)
+    if not eww("open", "audition"):
+        notify(f"Trial: keep within {m['seconds']} s", f"{', '.join(m['changed'])} · `audition keep`, or it reverts")
+    sound("relay")
+    print(f"Trial running: {', '.join(m['changed'])}. Keep within {m['seconds']} s "
+          "(`audition keep`) or it reverts.")
+
+
+def keep():
+    m = meta()
+    if not m:
+        print("No trial in progress."); return
+    sh("systemctl", "--user", "stop", f"{UNIT}.timer")
+    shutil.rmtree(TRIAL, ignore_errors=True)
+    eww("close", "audition")
+    sound("saved")
+    notify("Kept", ", ".join(m.get("changed", [])))
+    print("Kept.")
+
+
+def revert(reason="manual"):
+    m = meta()
+    if not m:
+        print("No trial in progress."); return
+    sh("systemctl", "--user", "stop", f"{UNIT}.timer")
+    for s in m["files"]:
+        shutil.copy2(s["snap"], s["file"])
+    reload_for([s["file"] for s in m["files"]])
+    shutil.rmtree(TRIAL, ignore_errors=True)
+    eww("close", "audition")
+    sound("warn" if reason != "manual" else "relay")
+    notify("Reverted" + ("" if reason == "manual" else f" ({reason})"),
+           ", ".join(Path(s["file"]).name for s in m["files"]),
+           "critical" if reason != "manual" else "normal")
+    print("Reverted.")
+
+
+def status_obj():
+    m = meta()
+    if not m or m.get("state") != "trial":
+        return {"active": False, "left": "", "files": "", "pct": 0}
+    left = max(0, m["deadline"] - time.time())
+    return {"active": True, "left": f"{int(left // 60)}:{int(left % 60):02d}",
+            "files": " · ".join(m.get("changed", [])), "pct": round(100 * left / m["seconds"])}
+
+
+def stream():
+    while True:
+        try:
+            print(json.dumps(status_obj()), flush=True)
+        except BrokenPipeError:
+            return
+        time.sleep(1 if meta() else 3)
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__.strip()); return
+    if a[0] == "apply": apply()
+    elif a[0] == "keep": keep()
+    elif a[0] == "revert": revert("timed out" if "--timeout" in a else "manual")
+    elif a[0] == "status": print(json.dumps(status_obj()))
+    elif a[0] == "stream": stream()
+    else:
+        seconds, edit, files = DEFAULT_SECONDS, True, []
+        it = iter(a)
+        for x in it:
+            if x in ("-t", "--time"):
+                seconds = int(next(it))
+            elif x == "--no-edit":
+                edit = False
+            else:
+                files.append(x)
+        if not files:
+            sys.exit("audition: which file? e.g. audition ~/.config/hypr/hyprland.conf")
+        start(files, seconds, edit)
+
+
+if __name__ == "__main__":
+    main()

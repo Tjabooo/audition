@@ -1,0 +1,17 @@
+$bg: #11111b; $line: #313244; $fg: #cdd6f4; $dim: #7f849c; $accent: #f9e2af;
+* { all: unset; font-family: "JetBrainsMono Nerd Font", monospace; }
+.trial {
+  background-color: rgba(17, 17, 27, 0.95);
+  border: 1px solid $line;
+  border-top: 3px solid $accent;
+  padding: 14px 16px;
+  color: $fg;
+  min-width: 620px;
+}
+.trial-tag   { font-size: 12px; font-weight: 800; color: $bg; background-color: $accent; padding: 3px 8px; }
+.trial-files { font-size: 12px; }
+.trial-left  { font-size: 18px; font-weight: 800; color: $accent; }
+.trial-bar   { margin-top: 10px; }
+.trial-bar trough   { min-height: 4px; background-color: $line; }
+.trial-bar progress { min-height: 4px; background-color: $accent; }
+.hint { font-size: 10px; color: $dim; margin-top: 8px; }

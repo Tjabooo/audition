@@ -1,0 +1,21 @@
+;; audition's countdown overlay. audition uses this config unless one of your own eww configs
+;; defines an `audition` window (copy this into yours to give it your theme).
+(deflisten trial
+  :initial '{"active":false,"left":"","files":"","pct":0}'
+  `audition stream`)
+
+(defwindow audition
+  :monitor 0
+  :geometry (geometry :anchor "top center" :y "56px")
+  :stacking "overlay"
+  :exclusive false
+  :focusable false
+  :namespace "audition"
+  (box :class "trial" :orientation "v" :space-evenly false
+    (box :space-evenly false :spacing 14
+      (label :class "trial-tag" :text "CONFIGURATION TRIAL")
+      (label :class "trial-files" :limit-width 40 :text "${trial.files}")
+      (box :hexpand true)
+      (label :class "trial-left" :text "${trial.left}"))
+    (progress :class "trial-bar" :value {trial.pct} :orientation "h")
+    (label :class "hint" :xalign 0 :text "audition keep  ·  audition revert  ·  otherwise it reverts itself")))
